@@ -108,6 +108,45 @@ def extract_tables_stream_sweep(page, debug=False):
     if debug: print(f"  - stream sweep produjo {len(dfs)} tablas (probadas {tried} combinaciones)")
     return dfs
 
+def extract_tables_word_clusters(page, debug=False):
+    """Reconstruye tablas agrupando palabras por filas/columnas cuando no hay líneas."""
+    try:
+        words = page.extract_words(
+            use_text_flow=True,
+            keep_blank_chars=False,
+            extra_attrs=["x0", "x1", "top", "bottom"],
+        )
+    except Exception:
+        words = []
+    if debug: print(f"  - word-clusters encontró {len(words)} palabras")
+    if not words:
+        return []
+
+    # Normalizar estructura a la esperada por ocr_table_from_image_words
+    cleaned = []
+    for w in words:
+        text = norm(w.get("text", ""))
+        if not text:
+            continue
+        try:
+            cleaned.append({
+                "text": text,
+                "x0": float(w["x0"]),
+                "x1": float(w["x1"]),
+                "top": float(w["top"]),
+                "bottom": float(w["bottom"]),
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    if debug: print(f"    tras limpieza quedan {len(cleaned)} palabras")
+    if len(cleaned) < 4:
+        return []
+
+    table_rows = ocr_table_from_image_words(cleaned, x_cluster_tol=12, y_cluster_tol=5)
+    df = dataframe_from_rows(table_rows) if table_rows else None
+    return [df] if df is not None else []
+
 # --------------- Camelot (opcional) ----------------
 def try_camelot_stream(pdf_path, page_number, debug=False):
     """Usa Camelot stream si está disponible. page_number es 1-based."""
@@ -258,6 +297,11 @@ def main():
                 if not dfs and has_text:
                     print(f"  - Página {i}: probamos Camelot(stream)")
                     dfs = try_camelot_stream(PDF_FILE, i, debug=True)
+
+                # C.1) último recurso antes de OCR: clustering de palabras del PDF
+                if not dfs and has_text:
+                    print(f"  - Página {i}: agrupamos palabras en grilla")
+                    dfs = extract_tables_word_clusters(page, debug=True)
 
                 # D) si no hay capa de texto → OCR
                 if not dfs and not has_text:
