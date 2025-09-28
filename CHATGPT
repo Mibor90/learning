@@ -1,1 +1,299 @@
-WSgGSGR
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re, sys, os, glob, gc
+import pandas as pd
+
+def norm(s): return re.sub(r"\s+", " ", str(s).strip())
+
+def dataframe_from_rows(rows):
+    if not rows or len(rows) < 2: return None
+    df = pd.DataFrame(rows).dropna(axis=1, how="all")
+    if df.shape[0] == 0 or df.shape[1] == 0: return None
+    header = [norm(x) for x in df.iloc[0]]
+    if all(h == "" or h.lower() == "nan" for h in header): return None
+    df = df.iloc[1:].reset_index(drop=True)
+    df.columns = header
+    df = df.dropna(how="all")
+    if df.shape[0] == 0 or df.shape[1] < 2: return None
+    return df
+
+def select_pdf():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    print(f"Buscando archivos PDF en: {script_dir}")
+    pdf_files = glob.glob(os.path.join(script_dir, "*.pdf"))
+    if not pdf_files:
+        print("No se encontraron archivos PDF en la carpeta del script"); return None
+    print("Archivos PDF encontrados:")
+    for i, f in enumerate(pdf_files, 1): print(f"{i}. {os.path.basename(f)}")
+    while True:
+        try:
+            choice = input(f"\nSelecciona un archivo (1-{len(pdf_files)}) o Enter: ").strip()
+            if not choice: return pdf_files[0]
+            idx = int(choice) - 1
+            if 0 <= idx < len(pdf_files): return pdf_files[idx]
+            print(f"Selecciona un número entre 1 y {len(pdf_files)}")
+        except ValueError:
+            print("Número inválido")
+        except KeyboardInterrupt:
+            print("\nOperación cancelada"); return None
+
+def dedupe_columns(cols):
+    seen = {}
+    out = []
+    for c in cols:
+        base = str(c) if str(c).strip() else "col"
+        n = seen.get(base, 0)
+        if n == 0:
+            out.append(base)
+        else:
+            out.append(f"{base}.{n+1}")
+        seen[base] = n + 1
+    return out
+
+
+# ---------------- pdfplumber lattice + stream -----------------
+import pdfplumber
+
+LATTICE = {
+    "vertical_strategy": "lines",
+    "horizontal_strategy": "lines",
+    "intersection_tolerance": 5,
+    "snap_tolerance": 3,
+    "join_tolerance": 3,
+    "edge_min_length": 3,
+}
+
+def extract_tables_lattice(page, debug=False):
+    try:
+        raw = page.extract_tables(table_settings=LATTICE) or []
+    except Exception:
+        raw = []
+    if debug: print(f"  - lattice detectó {len(raw)} estructuras")
+    dfs = []
+    for t in raw:
+        df = dataframe_from_rows(t)
+        if df is not None: dfs.append(df)
+    return dfs
+
+def extract_tables_stream_sweep(page, debug=False):
+    """Barre tolerancias de stream para exprimir tablas sin líneas."""
+    dfs = []
+    tried = 0
+    for xt in (2,3,4,5,6,7,8):
+        for yt in (2,3,4,5,6,7,8):
+            settings = {
+                "vertical_strategy": "text",
+                "horizontal_strategy": "text",
+                "text_x_tolerance": xt,
+                "text_y_tolerance": yt,
+                "keep_blank_chars": True,
+            }
+            tried += 1
+            try:
+                raw = page.extract_tables(table_settings=settings) or []
+            except Exception:
+                raw = []
+            if debug: print(f"    stream xt={xt} yt={yt} -> {len(raw)} estructuras")
+            for t in raw:
+                df = dataframe_from_rows(t)
+                if df is None: continue
+                # evitar duplicados exactos
+                dup = any((tuple(df.columns)==tuple(d.columns) and df.shape==d.shape and df.equals(d)) for d in dfs)
+                if not dup: dfs.append(df)
+            # heurística: si ya tenemos tablas con >=3 columnas, paramos pronto
+            if any(d.shape[1] >= 3 for d in dfs) and len(dfs) >= 1:
+                break
+        if dfs: break
+    if debug: print(f"  - stream sweep produjo {len(dfs)} tablas (probadas {tried} combinaciones)")
+    return dfs
+
+# --------------- Camelot (opcional) ----------------
+def try_camelot_stream(pdf_path, page_number, debug=False):
+    """Usa Camelot stream si está disponible. page_number es 1-based."""
+    try:
+        import camelot  # requiere camelot-py[cv] + ghostscript
+    except Exception:
+        if debug: print("  - Camelot no disponible, saltando...")
+        return []
+    try:
+        tables = camelot.read_pdf(pdf_path, pages=str(page_number), flavor="stream")
+    except Exception as e:
+        if debug: print(f"  - Camelot error: {e}")
+        return []
+    if debug: print(f"  - Camelot(stream) encontró {tables.n} tablas")
+    dfs = []
+    for i in range(tables.n):
+        df = tables[i].df
+        # Limpieza similar
+        df = df.replace(r"\r", " ", regex=True)
+        header = [norm(x) for x in df.iloc[0].tolist()]
+        if all(h == "" or h.lower()=="nan" for h in header): continue
+        df.columns = header
+        # Si hay encabezados repetidos, renómbralos de forma única
+        if len(set(df.columns)) != len(df.columns):
+            df.columns = dedupe_columns(df.columns)
+        df = df.iloc[1:].reset_index(drop=True)
+        if df.shape[1] >= 2 and df.shape[0] > 0:
+            dfs.append(df)
+    return dfs
+
+# --------------- OCR fallback (pytesseract) ----------------
+def ocr_table_from_image_words(words, x_cluster_tol=20, y_cluster_tol=6):
+    """
+    words: lista dicts con x0,x1,top,bottom,text de pdfplumber (tras OCR)
+    Agrupa por filas (y) y luego arma columnas por clusters (x).
+    """
+    if not words: return []
+    # 1) agrupar por filas (y midpoint)
+    rows = {}
+    for w in words:
+        y = (w["top"] + w["bottom"]) / 2.0
+        # buscar fila cercana
+        key = None
+        for k in list(rows.keys()):
+            if abs(k - y) <= y_cluster_tol:
+                key = k; break
+        if key is None: key = y
+        rows.setdefault(key, []).append(w)
+    # ordenar filas por y
+    row_keys = sorted(rows.keys())
+    grid_rows = []
+    # 2) estimar columnas por clustering de x-midpoints global (rápido)
+    xs = []
+    for arr in rows.values():
+        for w in arr:
+            xs.append((w["x0"] + w["x1"]) / 2.0)
+    xs = sorted(xs)
+    col_centers = []
+    for x in xs:
+        if not col_centers or abs(col_centers[-1] - x) > x_cluster_tol:
+            col_centers.append(x)
+    col_centers = sorted(col_centers)
+    # 3) para cada fila, asignar cada palabra a la columna más cercana y unir textos
+    for yk in row_keys:
+        arr = sorted(rows[yk], key=lambda w: w["x0"])
+        cells = [""] * len(col_centers)
+        for w in arr:
+            xmid = (w["x0"] + w["x1"]) / 2.0
+            # columna más cercana
+            idx = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - xmid))
+            cells[idx] = (cells[idx] + " " + w["text"]).strip()
+        grid_rows.append(cells)
+    # heurística header = fila más “densa”
+    lens = [sum(1 for c in r if c) for r in grid_rows]
+    if not lens: return []
+    header_idx = lens.index(max(lens))
+    header = [norm(c) for c in grid_rows[header_idx]]
+    table = [header]
+    for i, r in enumerate(grid_rows):
+        if i == header_idx: continue
+        # descartar filas demasiado vacías
+        if sum(1 for c in r if norm(c)) == 0: continue
+        table.append([norm(c) for c in r])
+    return table
+
+def extract_with_ocr(page, debug=False):
+    """Si la página no tiene texto, rasterizamos + OCR y agrupamos palabras."""
+    # Rasterizar con pdfplumber → PIL.Image
+    im = page.to_image(resolution=300).original
+    # OCR con pytesseract
+    try:
+        import pytesseract
+    except Exception:
+        if debug: print("  - pytesseract no disponible. Instálalo para OCR.")
+        return []
+    try:
+        # Obtener boxes con pdfplumber (palabras extraídas tras OCR por layout)
+        # Truco: usar pytesseract para texto y luego mapear posiciones con pdfplumber.extract_words()
+        # Más robusto: directamente usar tesseract image_to_data y reconstruir palabras con bbox.
+        from pytesseract import image_to_data
+        import numpy as np
+        import pandas as pd
+        data = image_to_data(im, output_type=pytesseract.Output.DATAFRAME)
+        data = data.dropna(subset=["text"])
+        words = []
+        for _, r in data.iterrows():
+            if str(r["text"]).strip() == "": continue
+            # bbox en px, simulamos el esquema de pdfplumber
+            x0 = float(r["left"]); y0 = float(r["top"])
+            w = float(r["width"]); h = float(r["height"])
+            words.append({
+                "text": str(r["text"]),
+                "x0": x0, "x1": x0 + w,
+                "top": y0, "bottom": y0 + h
+            })
+        if debug: print(f"  - OCR extrajo {len(words)} palabras")
+        table_rows = ocr_table_from_image_words(words)
+        df = dataframe_from_rows(table_rows) if table_rows else None
+        return [df] if df is not None else []
+    except Exception as e:
+        if debug: print(f"  - OCR fallo: {e}")
+        return []
+
+# ---------------- MAIN ----------------
+def main():
+    PDF_FILE = select_pdf()
+    if not PDF_FILE: sys.exit(1)
+    print(f"Archivo PDF seleccionado: {PDF_FILE}")
+    if not os.path.exists(PDF_FILE):
+        print(f"Error: No se encontró el archivo {PDF_FILE}"); sys.exit(1)
+
+    all_tables = []
+    with pdfplumber.open(PDF_FILE) as pdf:
+        print(f"Procesando PDF con {len(pdf.pages)} páginas...")
+        for i, page in enumerate(pdf.pages, start=1):
+            try:
+                # 0) ¿hay texto en la página?
+                has_text = bool(page.extract_words())
+                # A) lattice primero (tu flujo)
+                dfs = extract_tables_lattice(page, debug=True)
+
+                # B) si lattice no sacó nada, probar stream con barrido
+                if not dfs and has_text:
+                    print(f"  - Página {i}: sin tablas con líneas → stream sweep")
+                    dfs = extract_tables_stream_sweep(page, debug=True)
+
+                # C) opcional: Camelot stream
+                if not dfs and has_text:
+                    print(f"  - Página {i}: probamos Camelot(stream)")
+                    dfs = try_camelot_stream(PDF_FILE, i, debug=True)
+
+                # D) si no hay capa de texto → OCR
+                if not dfs and not has_text:
+                    print(f"  - Página {i}: parece escaneada → OCR")
+                    dfs = extract_with_ocr(page, debug=True)
+
+                if not dfs:
+                    print(f"  - Página {i}: sin tablas válidas (lattice/stream/ocr)")
+                    continue
+
+                for j, df in enumerate(dfs, 1):
+                    print(f"  - P{i} T{j}: {df.shape[0]} filas, {df.shape[1]} columnas")
+                    all_tables.append((f"P{i}_T{j}", df))
+
+            except Exception as e:
+                print(f"Error procesando página {i}: {e}")
+
+    if not all_tables:
+        print("No se detectaron tablas. Si puedes, dame el PDF o un recorte de la tabla.")
+        sys.exit(0)
+
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tables_out")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Guardando {len(all_tables)} tablas en: {out_dir}")
+
+    for idx, (tname, df) in enumerate(all_tables, start=1):
+        # Limpieza vectorizada (sirve aunque haya columnas duplicadas)
+        df = (df.astype(str)
+            .replace({r"\r?\n": " "}, regex=True)
+            .applymap(lambda s: s.strip()))
+        safe = re.sub(r"[^A-Za-z0-9_-]+","_", tname)
+        path = os.path.join(out_dir, f"table_{idx:02d}_{safe}.csv")
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        del df; gc.collect()
+
+    print("✓ Listo: una tabla por archivo en 'tables_out/'")
+
+if __name__ == "__main__":
+    main()
